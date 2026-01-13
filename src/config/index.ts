@@ -15,7 +15,7 @@ export const API_URLS = {
   coingecko:
     '/api/coingecko?ids=bitcoin,ethereum,solana&vs_currencies=usd&include_24hr_change=true',
   polymarket: '/api/polymarket?closed=false&order=volume&ascending=false&limit=100',
-  earthquakes: '/api/earthquake/fdsnws/event/1/query?format=geojson&minmagnitude=4.5&limit=100',
+  earthquakes: '/api/earthquakes',
 };
 
 export const REFRESH_INTERVALS = {
