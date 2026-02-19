@@ -1121,7 +1121,17 @@
       "noNotes": "No notes added",
       "addNotePlaceholder": "Add verification note...",
       "add": "Add",
-      "resetChecklist": "Reset Checklist"
+      "resetChecklist": "Reset Checklist",
+      "checks": {
+        "recency": "Recent timestamp confirmed",
+        "geolocation": "Location verified",
+        "source": "Primary source identified",
+        "crossref": "Cross-referenced with other sources",
+        "noAi": "No AI generation artifacts",
+        "noRecrop": "Not recycled/old footage",
+        "metadata": "Metadata verified",
+        "context": "Context established"
+      }
     },
     "liveNews": {
       "retry": "Retry",
