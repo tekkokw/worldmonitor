@@ -21,6 +21,7 @@ export const CRYPTO_META: Record<string, { name: string; symbol: string }> = {
   bitcoin: { name: 'Bitcoin', symbol: 'BTC' },
   ethereum: { name: 'Ethereum', symbol: 'ETH' },
   solana: { name: 'Solana', symbol: 'SOL' },
+  ripple: { name: 'XRP', symbol: 'XRP' },
 };
 
 // ========================================================================
