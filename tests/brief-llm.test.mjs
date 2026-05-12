@@ -19,6 +19,7 @@ import {
   buildDigestPrompt,
   parseDigestProse,
   validateDigestProseShape,
+  checkLeadGrounding,
   generateDigestProse,
   generateDigestProsePublic,
   enrichBriefEnvelopeWithLLM,
@@ -32,6 +33,18 @@ import { composeBriefFromDigestStories } from '../scripts/lib/brief-compose.mjs'
 
 // ── Fixtures ───────────────────────────────────────────────────────────────
 
+// IMPORTANT: the default `headline` here is load-bearing for many
+// downstream tests in this file. Specifically, every `generateDigestProse`
+// and `generateDigestProsePublic` test feeds `validJson` (a fixture lead
+// that names "Iran" and "Strait of Hormuz") against a stories array
+// derived from `story()`. The v5 grounding gate (PR #3667) requires the
+// lead to share ≥1 anchor token with at least one story headline. If
+// you change the default headline so it no longer mentions "Iran" or
+// "Hormuz", `validJson` becomes ungrounded, every cache-shape test in
+// the `generateDigestProse` describe block silently rejects, and you
+// see cascading "expected truthy, got null" assertions whose root cause
+// is invisible. Either keep "Iran" + "Hormuz" in this default OR pass
+// an `overrides.headline` AND update the relevant `validJson` lead.
 function story(overrides = {}) {
   return {
     category: 'Diplomacy',
@@ -461,17 +474,48 @@ describe('generateDigestProse', () => {
     assert.equal(llm2.calls.length, 1, 'category change re-keys the cache');
   });
 
+  it('shape-valid but UNGROUNDED cached row is rejected on hit and re-LLM is called (May 12 incident)', async () => {
+    // Models the exact 2026-05-12 failure mode: a cached row whose
+    // shape is valid (lead + threads + signals all present and well-
+    // formed) but whose content names entities that appear in NO
+    // story headline. Pre-v5 the cache-hit path would happily serve
+    // this row to every send for 4h. Post-v5 the grounding gate
+    // trips and the cron re-rolls the LLM.
+    const cache = makeCache();
+    const llm1 = makeLLM(validJson);
+    await generateDigestProse('user_a', stories, 'all', { ...cache, callLLM: llm1.callLLM });
+
+    const badKey = [...cache.store.keys()].find((k) => k.startsWith('brief:llm:digest:v5:'));
+    assert.ok(badKey, 'expected a digest prose cache entry');
+    // Overwrite with a payload whose content has zero proper-noun
+    // overlap with `stories` (Iran Hormuz / Gaza). Shape is impeccable.
+    cache.store.set(badKey, {
+      lead: 'President Biden announced a new executive order targeting cryptocurrency mixers and privacy coins, citing national security concerns over illicit finance.',
+      threads: [
+        { tag: 'Cybersecurity', teaser: "Biden's executive order directly targets cryptocurrency mixers." },
+        { tag: 'Finance', teaser: 'Treasury Department develops new regulations against digital assets.' },
+      ],
+      signals: ['Watch for Treasury rule-making on crypto mixers.'],
+      rankedStoryHashes: [],
+    });
+    const llm2 = makeLLM(validJson);
+    const out = await generateDigestProse('user_a', stories, 'all', { ...cache, callLLM: llm2.callLLM });
+    assert.ok(out, 'grounding-failed hit must fall through to LLM, not return the hallucination');
+    assert.equal(llm2.calls.length, 1, 'ungrounded cache row treated as miss — re-LLM called');
+    assert.match(out.lead, /Hormuz/, 'returned lead is the freshly-rolled grounded one, not the cached hallucination');
+  });
+
   it('malformed cached row is rejected on hit and re-LLM is called', async () => {
     const cache = makeCache();
     // Seed a bad cached row that would poison the envelope: missing
     // `threads`, which the renderer's assertBriefEnvelope requires.
     const llm1 = makeLLM(validJson);
     await generateDigestProse('user_a', stories, 'all', { ...cache, callLLM: llm1.callLLM });
-    // Corrupt the stored row in place. Cache key prefix bumped to v3
-    // (2026-04-25) when the digest hash gained ctx (profile, greeting,
-    // isPublic) and per-story `hash` fields. v2 rows are ignored on
-    // rollout; v3 is the active prefix.
-    const badKey = [...cache.store.keys()].find((k) => k.startsWith('brief:llm:digest:v4:'));
+    // Corrupt the stored row in place. Cache key prefix bumped to v5
+    // (2026-05-12) when validateDigestProseShape gained the
+    // grounding gate. v3 rows ignored at v4 rollout; v4 rows ignored
+    // at v5 rollout — see generateDigestProse header comment.
+    const badKey = [...cache.store.keys()].find((k) => k.startsWith('brief:llm:digest:v5:'));
     assert.ok(badKey, 'expected a digest prose cache entry');
     cache.store.set(badKey, { lead: 'short', /* missing threads + signals */ });
     const llm2 = makeLLM(validJson);
@@ -543,13 +587,326 @@ describe('validateDigestProseShape', () => {
   });
 });
 
+// ── checkLeadGrounding + integration with validateDigestProseShape ─────────
+//
+// Regression cover for the 2026-05-12 incident: a Trump-era geopolitics
+// pool (Iran/Israel/Sudan/Cuba/Ukraine) shipped a "President Biden
+// announced a crypto executive order" lead. The shape validator passed
+// it because the JSON was well-formed; the renderer happily injected
+// it; the user opened the email and read four paragraphs of fabricated
+// content with zero overlap with the rendered story cards.
+//
+// The grounding gate's job: catch shape-valid-but-content-fabricated
+// leads BEFORE they reach the renderer. The validator returns null,
+// the cron's three-level fallback chain falls through to L2 (capped
+// pool, no profile/greeting) and ultimately L3 (stub). The user gets
+// either a re-rolled grounded lead or a degraded "Digest" subject —
+// never a hallucinated headline they'll screenshot and tweet.
+
+describe('checkLeadGrounding', () => {
+  // ── Fixtures: actual May 12 incident payload ───────────────────────
+  //
+  // Stories: the 12 events that shipped in the magazine envelope on
+  // 2026-05-12 (verified by re-fetching the live brief share URL).
+  // Lead: the verbatim text the email Executive Summary block sent.
+  const may12Stories = [
+    { headline: "Trump says Iran ceasefire is 'on life support' after he rejects Tehran's response" },
+    { headline: 'Israeli killings in Lebanon rise: Is even the pretence of a ceasefire over?' },
+    { headline: 'Armed drones leading cause of civilian death in Sudan war: UN rights chief' },
+    { headline: 'How I offered spiritual consultancy for coup attempt leader, defendant says in video recording' },
+    { headline: "Trump and Rubio's escalating rhetoric show a Cuban invasion could be imminent" },
+    { headline: 'Russia and Ukraine trade blame for continued fighting that killed at least 2 as U.S.-brokered ceasefire nears its end' },
+    { headline: "US issues new sanctions over Iran's oil shipments to China" },
+    { headline: 'EU approves sanctions on Israeli settlers after Hungarian backing' },
+    { headline: 'EU sanctions Russian officials over deportation of Ukrainian children' },
+    { headline: "EU sanctions officials over Russia's deportation of Ukrainian children" },
+    { headline: 'EU announces sanctions against violent Israel settlers' },
+    { headline: "Senior RSF commander switches sides in Sudan's civil war" },
+  ];
+
+  const may12HallucinatedSynthesis = {
+    lead: 'Good morning. President Biden announced a new executive order targeting cryptocurrency mixers and privacy coins, citing national security concerns over illicit finance. This move follows increasing pressure from financial regulators to curb the use of digital assets in money laundering and sanctions evasion.',
+    threads: [
+      { tag: 'Cybersecurity', teaser: "Biden's executive order directly targets cryptocurrency mixers and privacy coins, aiming to disrupt illicit financial flows." },
+      { tag: 'Finance', teaser: 'The Treasury Department is tasked with developing new regulations and enforcement actions against digital asset use in criminal activities.' },
+      { tag: 'Regulation', teaser: 'The order mandates a whole-of-government approach to assess and address the national security risks posed by digital assets.' },
+      { tag: 'Technology', teaser: 'The executive order could significantly impact the development and adoption of privacy-enhancing blockchain technologies.' },
+    ],
+  };
+
+  // The actual magazine lead from 2026-05-12 — properly grounded in
+  // the Iran/oil-sanctions story cluster. Used as the positive control.
+  const may12GroundedSynthesis = {
+    lead: "The US imposed fresh sanctions on Iran's oil shipments to China, directly impacting Tehran's revenue streams. This move comes as former President Trump declared the Iran ceasefire 'on life support' after rejecting Tehran's response.",
+    threads: [
+      { tag: 'Energy', teaser: "Iran's illicit oil trade with China faces new US sanctions targeting shipping entities." },
+      { tag: 'Diplomacy', teaser: 'EU sanctions Russian officials over the forced deportation of Ukrainian children.' },
+    ],
+  };
+
+  it('REGRESSION (May 12 incident): rejects the verbatim Biden+crypto lead against the verbatim Iran/Israel/Sudan story pool', () => {
+    // The single regression test that would have prevented the
+    // 2026-05-12 send. Both inputs are byte-verbatim from the live
+    // incident — story headlines from the magazine envelope, lead +
+    // threads from the email's Executive Summary block.
+    assert.equal(checkLeadGrounding(may12HallucinatedSynthesis, may12Stories), false,
+      'a lead naming Biden + Treasury Department + cryptocurrency must NOT pass when no story headline mentions any of those entities');
+  });
+
+  it('accepts the actual magazine lead against the same May 12 story pool', () => {
+    // Positive control. Same stories, properly grounded synthesis.
+    // Hits: trump, iran, tehran, china, russian, ukrainian.
+    assert.equal(checkLeadGrounding(may12GroundedSynthesis, may12Stories), true);
+  });
+
+  it('skips the check when stories is undefined / null / empty (back-compat)', () => {
+    // Pre-v5 callers (and the public-share renderer's stub branches)
+    // call validateDigestProseShape without stories. Skipping is
+    // correct — those paths can't ground-check, and the alternative
+    // (always reject) would break envelope rendering.
+    assert.equal(checkLeadGrounding(may12HallucinatedSynthesis, undefined), true);
+    assert.equal(checkLeadGrounding(may12HallucinatedSynthesis, null), true);
+    assert.equal(checkLeadGrounding(may12HallucinatedSynthesis, []), true);
+  });
+
+  it('skips the check when the story corpus has no proper-noun anchors', () => {
+    // Edge case: a degenerate corpus where every headline is short or
+    // lowercase. The check has nothing to compare against, so it
+    // accepts rather than false-positive. Real production pools never
+    // hit this branch — the corner exists for synthetic / fixture
+    // inputs.
+    const lowercaseOnly = [{ headline: 'a b c d e' }, { headline: 'foo bar baz' }];
+    assert.equal(checkLeadGrounding(may12HallucinatedSynthesis, lowercaseOnly), true);
+  });
+
+  it('relaxes threshold to 1 hit when corpus has fewer than 4 anchor tokens', () => {
+    // Single-story brief with one named actor: the lead must mention
+    // that actor, but we don't demand TWO matches — the corpus only
+    // has one. Without this relaxation, every 1- or 2-story brief
+    // would false-positive into stub-mode.
+    const sparseStories = [{ headline: 'Hegseth declares blockade going global' }];
+    const groundedThin = {
+      lead: 'Pentagon chief Hegseth declared the US blockade on Iran is going global, escalating the standoff.',
+      threads: [{ tag: 'Defense', teaser: 'Pentagon doctrine shifts toward direct confrontation.' }],
+    };
+    assert.equal(checkLeadGrounding(groundedThin, sparseStories), true,
+      'sparse corpus + lead names the one anchor → accept');
+    const ungroundedThin = {
+      lead: 'President Biden signed a new education funding bill at the White House this morning.',
+      threads: [{ tag: 'Domestic', teaser: 'Funding shifts toward early-childhood programs.' }],
+    };
+    assert.equal(checkLeadGrounding(ungroundedThin, sparseStories), false,
+      'sparse corpus + lead with no anchor overlap → reject');
+  });
+
+  it('REGRESSION (PR #3667 review #1): rejects when the LEAD is hallucinated even if THREADS are grounded', () => {
+    // Pre-fix the validator combined lead + threads into a single
+    // haystack and counted hits across the whole. A hallucinated
+    // lead could ride on top of grounded teasers — the visible
+    // headline of the email stayed fabricated even though the
+    // combined check passed. Post-fix the lead must independently
+    // hit ≥1 anchor.
+    const hallucinatedLeadGroundedThreads = {
+      lead: 'President Biden announced a new executive order targeting cryptocurrency mixers and privacy coins, citing national security concerns.',
+      threads: [
+        { tag: 'Diplomacy', teaser: "Trump rejected Tehran's response to the ceasefire proposal." },
+        { tag: 'Conflict', teaser: 'Sudan civilian deaths from drone strikes continue rising.' },
+      ],
+    };
+    assert.equal(checkLeadGrounding(hallucinatedLeadGroundedThreads, may12Stories), false,
+      'lead with zero anchor overlap must reject regardless of how many anchors the teasers carry');
+
+    // Counter-control: same threads, lead now grounds independently.
+    const groundedLeadGroundedThreads = {
+      ...hallucinatedLeadGroundedThreads,
+      lead: 'Trump declared the Iran ceasefire on life support after rejecting Tehran\'s response, hardening the standoff.',
+    };
+    assert.equal(checkLeadGrounding(groundedLeadGroundedThreads, may12Stories), true);
+  });
+
+  it('REGRESSION (PR #3667 review #2): word-boundary matching — does NOT accept "iran" inside "tirana" or "oman" inside "romania"', () => {
+    // Pre-fix the validator used haystack.includes(tok) which is a
+    // substring match. So a corpus anchor of "iran" would hit on
+    // "tirana", "oman" on "romania", "india" on "indiana". Post-fix
+    // both sides are tokenised on the same delimiter set into a Set
+    // and matched by membership, killing this class of false
+    // positive.
+    const corpus = [
+      { headline: 'Iran responds to US sanctions on oil exports' },
+      { headline: 'Oman mediates regional ceasefire talks' },
+      { headline: 'India launches new satellite from Sriharikota' },
+    ];
+    // Synthesis prose with all the substring traps and zero actual
+    // anchor mentions. Pre-fix this would pass: "tirana" contains
+    // "iran", "romania" contains "oman", "indiana" contains "india".
+    const substringTrap = {
+      lead: 'Officials met in Tirana, Albania today to discuss Romania-Serbia trade routes alongside the new Indiana semiconductor fab.',
+      threads: [
+        { tag: 'Trade', teaser: 'European corridors via Tirana and Romania see renewed Indiana-bound activity.' },
+      ],
+    };
+    assert.equal(checkLeadGrounding(substringTrap, corpus), false,
+      'substring matches inside unrelated city/country names must not count as anchor hits');
+
+    // Counter-control: real word-boundary matches still pass.
+    const realMatch = {
+      lead: 'Iran and Oman pursued back-channel talks after India announced new export controls.',
+      threads: [{ tag: 'Diplomacy', teaser: 'Tehran-Muscat coordination accelerated.' }],
+    };
+    assert.equal(checkLeadGrounding(realMatch, corpus), true);
+  });
+
+  it('REGRESSION (PR #3667 review round 2 #1): generic capitalised words like "President", "Senior", "Officials" are NOT counted as anchors', () => {
+    // Pre-fix the anchor extractor accepted any capitalised word
+    // ≥4 chars. So a headline like "President Trump signed Iran
+    // sanctions" added "president" to the anchor set, and a
+    // hallucinated lead "President Biden announced..." passed the
+    // lead-anchor check via the shared "president" token. Combined
+    // with a teaser mentioning Iran, the whole synthesis would
+    // accept — exactly the failure mode this PR is trying to block.
+    // Post-fix the stopword list strips title/role/filler words
+    // before they enter storyTokens.
+    const corpusWithTitledHeadlines = [
+      { headline: 'President Trump signed new Iran sanctions executive order' },
+      { headline: 'Senior Officials confirm coup attempt failed' },
+      { headline: 'Federal court rejects challenge to ruling' },
+    ];
+
+    // Hallucinated lead riding on shared "president" + teaser ground.
+    const presidentRideAlong = {
+      lead: 'President Biden announced a new executive order targeting cryptocurrency mixers and privacy coins.',
+      threads: [
+        { tag: 'Diplomacy', teaser: "Iran responded sharply to the new sanctions." },
+      ],
+    };
+    assert.equal(checkLeadGrounding(presidentRideAlong, corpusWithTitledHeadlines), false,
+      '"president" must NOT count as an anchor — it is a generic title that any hallucination can ride on');
+
+    // Counter-control: same corpus, real grounded lead.
+    const realGround = {
+      lead: 'Trump signed a new Iran sanctions order targeting oil exports.',
+      threads: [{ tag: 'Diplomacy', teaser: 'Iran condemned the move.' }],
+    };
+    assert.equal(checkLeadGrounding(realGround, corpusWithTitledHeadlines), true);
+  });
+
+  it('REGRESSION (PR #3667 review round 3): bigram-leading titles (Prime Minister, Chief Justice, Cardinal Smith) — first word is also stopwordded', () => {
+    // Round 2 added "President" to the stopword set, but other
+    // common bigram titles slipped through. "Prime Minister
+    // Netanyahu says Iran..." adds "prime" to anchors, then a
+    // hallucinated "Prime Minister Trudeau announced cryptocurrency
+    // restrictions..." passes the lead-anchor check via "prime",
+    // and a teaser mentioning Iran satisfies the combined threshold.
+    // Same shape works for Chief Justice / Cardinal X / Chancellor X
+    // / Speaker X / Ambassador X / etc.
+    const corpus = [
+      { headline: 'Prime Minister Netanyahu says Iran threats continue' },
+      { headline: 'Chief Justice rules on Sudan war crimes case' },
+      { headline: 'Cardinal Pell addresses Vatican synod' },
+    ];
+
+    const primeRideAlong = {
+      lead: 'Prime Minister Trudeau announced new cryptocurrency mixer restrictions across Canadian financial institutions.',
+      threads: [
+        { tag: 'Diplomacy', teaser: 'Iran responded to the regulatory crackdown with sanctions criticism.' },
+      ],
+    };
+    assert.equal(checkLeadGrounding(primeRideAlong, corpus), false,
+      '"prime" must NOT count as an anchor — it is a bigram-title prefix that lets unrelated PMs share a token with real ones');
+
+    const chiefRideAlong = {
+      lead: 'Chief Justice Roberts issued an opinion on US executive privilege today.',
+      threads: [{ tag: 'Conflict', teaser: 'Sudan war crimes trial advances.' }],
+    };
+    assert.equal(checkLeadGrounding(chiefRideAlong, corpus), false,
+      '"chief" alone must not anchor — only the discriminating name (Roberts vs the corpus name) should');
+
+    const cardinalRideAlong = {
+      lead: 'Cardinal Smith led a service in Boston yesterday alongside local clergy.',
+      threads: [{ tag: 'Domestic', teaser: 'Vatican plans new synod for autumn.' }],
+    };
+    // 'cardinal' filtered, 'smith' is not in corpus, 'boston' is not.
+    // Teaser has 'vatican' which IS in corpus → combined hits = 1.
+    // Lead-only hits = 0 → REJECT.
+    assert.equal(checkLeadGrounding(cardinalRideAlong, corpus), false,
+      '"cardinal" alone must not anchor; lead must name the actual entity from the corpus');
+
+    // Counter-control: a real grounded lead naming an actual corpus
+    // anchor (Netanyahu / Iran / Pell / Vatican) still passes.
+    const realGround = {
+      lead: 'Netanyahu addressed Iran threats during a security cabinet briefing today.',
+      threads: [{ tag: 'Diplomacy', teaser: 'Vatican synod parallel session continues.' }],
+    };
+    assert.equal(checkLeadGrounding(realGround, corpus), true);
+  });
+
+  it('REGRESSION (PR #3667 review round 2 #2): Unicode apostrophes (U+2019) in headlines do not strand grounded leads', () => {
+    // Pre-fix the delimiter regex only included ASCII apostrophe.
+    // Reuters/AP/Guardian headlines use U+2019 ("China’s", "Iran’s",
+    // "DPRK’s") which the regex didn't split. So "China’s" became
+    // a single token "china’s" and a lead saying "China" was a
+    // false negative — rejected despite genuinely grounding.
+    const corpusUnicodeApostrophes = [
+      { headline: 'China’s economy grew despite US tariffs' },
+      { headline: 'Iran’s foreign minister rejected the proposal' },
+      { headline: 'DPRK’s missile test draws sanctions response' },
+    ];
+
+    const groundedLeadAsciiQuotes = {
+      lead: 'China responded to US tariffs while Iran condemned diplomatic isolation efforts and DPRK staged another missile test.',
+      threads: [{ tag: 'Energy', teaser: 'China imports continue rising.' }],
+    };
+    assert.equal(checkLeadGrounding(groundedLeadAsciiQuotes, corpusUnicodeApostrophes), true,
+      'Unicode apostrophes must split — "China’s" and "China" should both tokenise to "china"');
+  });
+
+  it('filters short-form acronyms (US, EU, UN, RSF) from anchor extraction — they are too generic to discriminate', () => {
+    // The 4-char length cap deliberately drops 2- and 3-letter
+    // acronyms. Otherwise a lead saying "US officials" against any
+    // pool with "US" in a headline would always pass — useless signal.
+    const acronymOnly = [{ headline: 'US EU UN RSF NATO' }];
+    // 'NATO' is 4 chars and would qualify; the rest don't.
+    assert.equal(checkLeadGrounding({ lead: 'Officials confirmed updates today across multiple agencies.', threads: [{ tag: 'X', teaser: 'Generic teaser text.' }] }, acronymOnly), false);
+    assert.equal(checkLeadGrounding({ lead: 'NATO ministers met in Brussels to discuss the coordinated response.', threads: [{ tag: 'X', teaser: 'Generic teaser text.' }] }, acronymOnly), true);
+  });
+
+  it('integration: validateDigestProseShape rejects the May 12 hallucination when stories is supplied', () => {
+    // The single load-bearing path. Without `stories`, the validator
+    // accepts (back-compat). With `stories`, the grounding gate fires.
+    const obj = {
+      ...may12HallucinatedSynthesis,
+      signals: ['Watch for Treasury rule-making.'],
+    };
+    assert.ok(validateDigestProseShape(obj), 'shape alone passes (back-compat: no stories → no gate)');
+    assert.equal(validateDigestProseShape(obj, may12Stories), null,
+      'shape passes but grounding fails → null → cron falls through to L2/L3');
+  });
+
+  it('integration: parseDigestProse forwards stories to the validator', () => {
+    // parseDigestProse is the entry point for fresh LLM output. It
+    // must thread stories through to the validator so the L1 result
+    // is grounding-checked the same way the L1 cache hit is.
+    const json = JSON.stringify({
+      ...may12HallucinatedSynthesis,
+      signals: ['Watch for Treasury rule-making.'],
+    });
+    assert.ok(parseDigestProse(json), 'no stories → shape only');
+    assert.equal(parseDigestProse(json, may12Stories), null,
+      'stories supplied → grounding gate trips on hallucinated lead');
+  });
+});
+
 // ── generateDigestProsePublic + cache-key independence (Codex Round-2 #4) ──
 
 describe('generateDigestProsePublic — public cache shared across users', () => {
-  const stories = [story(), story({ headline: 'Second', country: 'PS' })];
+  // `story()` headline mentions Iran/Hormuz; the override here adds a
+  // Gaza headline so the corpus has anchors. validJson lead must
+  // ground in those headlines (Hormuz, Iran, Gaza) — otherwise the
+  // v5 grounding gate rejects and these cache-shape tests can't write.
+  const stories = [story(), story({ headline: 'Second story on Gaza', country: 'PS' })];
   const validJson = JSON.stringify({
-    lead: 'A non-personalised editorial lead generated for the share-URL surface, free of profile context.',
-    threads: [{ tag: 'Energy', teaser: 'Hormuz tensions resurface today.' }],
+    lead: 'Iran threats to close the Strait of Hormuz dominated the share-URL editorial today, with Gaza humanitarian developments riding alongside.',
+    threads: [{ tag: 'Energy', teaser: 'Hormuz tensions resurface today across the Strait.' }],
     signals: ['Watch for naval redeployment in the Gulf.'],
   });
 
@@ -631,12 +988,13 @@ describe('generateDigestProsePublic — public cache shared across users', () =>
     assert.equal(llm2.calls.length, 1, 'profile change re-keys the cache');
   });
 
-  it('writes to cache under brief:llm:digest:v4 prefix (not v3)', async () => {
+  it('writes to cache under brief:llm:digest:v5 prefix (v4/v3/v2 evicted)', async () => {
     const cache = makeCache();
     const llm = makeLLM(validJson);
     await generateDigestProse('user_a', stories, 'all', { ...cache, callLLM: llm.callLLM });
     const keys = [...cache.store.keys()];
-    assert.ok(keys.some((k) => k.startsWith('brief:llm:digest:v4:')), 'v4 prefix used');
+    assert.ok(keys.some((k) => k.startsWith('brief:llm:digest:v5:')), 'v5 prefix used');
+    assert.ok(!keys.some((k) => k.startsWith('brief:llm:digest:v4:')), 'no v4 writes');
     assert.ok(!keys.some((k) => k.startsWith('brief:llm:digest:v3:')), 'no v3 writes');
     assert.ok(!keys.some((k) => k.startsWith('brief:llm:digest:v2:')), 'no v2 writes');
   });
